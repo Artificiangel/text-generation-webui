@@ -29,6 +29,7 @@ from modules.html_generator import generate_basic_html
 from modules.logging_colors import logger
 from modules.models import clear_torch_cache
 
+gen_reply_function = []
 
 def generate_reply(*args, **kwargs):
     shared.generation_lock.acquire()
@@ -52,9 +53,9 @@ def _generate_reply(question, state, stopping_strings=None, is_chat=False, escap
         if shared.model.__class__.__name__ in ['LlamaCppModel', 'Exllamav2Model']:
             generate_func = generate_reply_custom
         else:
-            generate_func = generate_reply_HF
+            generate_func = gen_reply_function[0]
 
-    if generate_func != generate_reply_HF and shared.args.verbose:
+    if generate_func != gen_reply_function[0] and shared.args.verbose:
         logger.info("PROMPT=")
         print(question)
         print()
@@ -405,6 +406,7 @@ def generate_reply_HF(question, original_question, seed, state, stopping_strings
         print(f'Output generated in {(t1-t0):.2f} seconds ({new_tokens/(t1-t0):.2f} tokens/s, {new_tokens} tokens, context {original_tokens}, seed {seed})')
         return
 
+gen_reply_function.append(generate_reply_HF)
 
 def generate_reply_custom(question, original_question, seed, state, stopping_strings=None, is_chat=False):
     """
