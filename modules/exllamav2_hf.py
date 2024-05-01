@@ -103,7 +103,7 @@ class Exllamav2HF(PreTrainedModel):
             past_seq = self.past_seq
             ex_cache = self.ex_cache
 
-        seq = input_ids[0].tolist()
+        seq = input_ids[0].tolist() # TODO
         if is_negative and past_key_values is not None:
             seq = past_key_values + seq
 
