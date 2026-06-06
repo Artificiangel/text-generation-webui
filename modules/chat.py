@@ -30,7 +30,7 @@ from modules.html_generator import (
 )
 from modules.image_utils import open_image_safely
 from modules.logging_colors import logger
-from modules.reasoning import THINKING_FORMATS
+from modules.reasoning import THINKING_FORMATS, extract_reasoning
 from modules.text_generation import (
     generate_reply,
     get_encoded_length,
@@ -50,9 +50,21 @@ _history_file_lock = threading.Lock()
 _tool_approvals = {}
 _tool_approvals_lock = threading.Lock()
 
+# Currently-viewed chat id (single-user mode only). Used to skip streaming UI
+# updates when the user switches to a different chat mid-stream.
+viewing_unique_id = None
+
+
+def set_viewing_unique_id(unique_id):
+    global viewing_unique_id
+    if not shared.args.multi_user:
+        viewing_unique_id = unique_id
+
 
 def request_tool_approval(session_key, tool_name):
-    """Block until the user approves/rejects a tool call. Returns 'approve'|'always'|'reject'."""
+    """Block until the user approves/rejects a tool call.
+    Returns 'approve'|'always'|'reject', or None if generation was stopped
+    before the user made a decision."""
     with _tool_approvals_lock:
         if session_key not in _tool_approvals:
             _tool_approvals[session_key] = {
@@ -68,7 +80,7 @@ def request_tool_approval(session_key, tool_name):
     while not session["event"].wait(timeout=0.5):
         if shared.stop_everything:
             session["tool_name"] = None
-            return 'reject'
+            return None
     session["tool_name"] = None
     return session["result"]
 
@@ -235,11 +247,14 @@ def _expand_tool_sequence(tool_seq):
     for item in tool_seq:
         if 'tool_calls' in item:
             deserialized = _deserialize_tool_call_arguments(item['tool_calls'])
-            messages.append({
+            msg = {
                 "role": "assistant",
                 "content": item.get('content', ''),
                 "tool_calls": deserialized
-            })
+            }
+            if item.get('reasoning_content'):
+                msg['reasoning_content'] = item['reasoning_content']
+            messages.append(msg)
             for tc in item['tool_calls']:
                 tc_id = tc.get('id', '')
                 if tc_id:
@@ -450,6 +465,7 @@ def generate_chat_prompt(user_input, state, **kwargs):
                 msg_dict = {"role": "assistant", "content": final_content}
                 if '<|channel|>analysis<|message|>' in assistant_msg:
                     msg_dict["thinking"] = thinking_content
+                    msg_dict["raw_content"] = assistant_msg
 
                 messages.insert(insert_pos, msg_dict)
 
@@ -473,7 +489,20 @@ def generate_chat_prompt(user_input, state, **kwargs):
                 msg_dict = {"role": "assistant", "content": final_content.strip()}
                 if thinking_content:
                     msg_dict["reasoning_content"] = thinking_content
+                    msg_dict["raw_content"] = assistant_msg
 
+                messages.insert(insert_pos, msg_dict)
+
+            # End-only </think> format (DeepSeek V4 Pro, Qwen3-next): the opener
+            # is emitted by the template's generation prompt, so model output starts
+            # with reasoning text and uses </think> as a separator.
+            elif '</think>' in assistant_msg:
+                thinking_content, final_content = assistant_msg.split('</think>', 1)
+                msg_dict = {"role": "assistant", "content": final_content.strip()}
+                thinking_content = thinking_content.strip()
+                if thinking_content:
+                    msg_dict["reasoning_content"] = thinking_content
+                    msg_dict["raw_content"] = assistant_msg
                 messages.insert(insert_pos, msg_dict)
 
             else:
@@ -546,17 +575,25 @@ def generate_chat_prompt(user_input, state, **kwargs):
         if _continue:
             messages = copy.deepcopy(messages)
         last_message = messages[-1].copy()
+
+        # Splice partial thoughts in-place to avoid a fresh thinking block from re-rendering.
+        content = last_message.get("content", "")
+        partial_thought = last_message.get("thinking", "") or last_message.get("reasoning_content", "")
+        thinking_only_partial = not content and bool(partial_thought.strip())
+
         if _continue:
-            if state['mode'] == 'chat-instruct':
+            if state['mode'] == 'chat-instruct' or not thinking_only_partial:
                 messages = messages[:-1]
             else:
                 messages[-1]["content"] = "fake assistant message replace me"
                 messages.append({"role": "assistant", "content": "this will get deleted"})
 
-        if state['mode'] != 'chat-instruct':
-            add_generation_prompt = (not _continue and not impersonate)
+        if state['mode'] == 'chat-instruct':
+            add_generation_prompt = _continue and not thinking_only_partial
+        elif thinking_only_partial:
+            add_generation_prompt = not _continue and not impersonate
         else:
-            add_generation_prompt = False
+            add_generation_prompt = not impersonate
 
         prompt = renderer(
             messages=messages,
@@ -574,24 +611,20 @@ def generate_chat_prompt(user_input, state, **kwargs):
                 outer_messages.append({"role": "system", "content": state['custom_system_message']})
 
             outer_messages.append({"role": "user", "content": command})
-            if _continue:
+            if _continue and thinking_only_partial:
                 outer_messages.append(last_message.copy())
                 outer_messages[-1]["content"] = "fake assistant message replace me"
                 outer_messages.append({"role": "assistant", "content": "this will get deleted"})
 
             prompt = instruct_renderer(
                 messages=outer_messages,
-                add_generation_prompt=not _continue
+                add_generation_prompt=not thinking_only_partial
             )
 
         if _continue:
-            prompt = prompt.split("fake assistant message replace me", 1)[0]
+            if thinking_only_partial:
+                prompt = prompt.split("fake assistant message replace me", 1)[0]
 
-            content = last_message.get("content", "")
-            partial_thought = last_message.get("thinking", "") or last_message.get("reasoning_content", "")
-
-            # Handle partial thinking blocks (GPT-OSS and Seed-OSS)
-            if not content and partial_thought and partial_thought.strip():
                 search_string = partial_thought.strip()
                 index = prompt.rfind(search_string)
                 if index != -1:
@@ -600,8 +633,29 @@ def generate_chat_prompt(user_input, state, **kwargs):
                     # Fallback if search fails: just append the thought
                     prompt += partial_thought
             else:
-                # All other cases
-                prompt += content
+                append_content = last_message.get("raw_content", "") or content
+                prompt_tail = prompt.rstrip("\n")
+
+                for fmt_start, fmt_end, fmt_content_tag in THINKING_FORMATS:
+                    if fmt_start is None or not prompt_tail.endswith(fmt_start):
+                        continue
+                    if append_content.startswith(fmt_start):
+                        # Avoid duplicating the opener the template already emitted
+                        append_content = append_content[len(fmt_start):].lstrip("\n")
+                    elif fmt_end and fmt_end in append_content:
+                        # Content closes the block itself (DeepSeek-style separator)
+                        pass
+                    else:
+                        # Close the opened thinking block so plain content doesn't land inside it
+                        prompt += "\n" + fmt_end + (fmt_content_tag or "") + "\n\n"
+                    break
+                else:
+                    # GPT-OSS: a bare "<|start|>assistant" gen prompt needs the final-channel
+                    # marker before plain content. raw_content already includes channel framing.
+                    if not last_message.get("raw_content") and prompt_tail.endswith("<|start|>assistant"):
+                        prompt += "<|channel|>final<|message|>"
+
+                prompt += append_content
 
         if impersonate:
             prompt = prompt.split("fake user message replace me", 1)[0]
@@ -731,6 +785,43 @@ def count_prompt_tokens(text_input, state):
     except Exception as e:
         logger.error(f"Error counting tokens: {e}")
         return f"Error: {str(e)}"
+
+
+def update_token_display_from_state(state):
+    import gradio as gr
+    if shared.model is None:
+        return gr.update()
+
+    prompt_n = getattr(shared.model, 'last_prompt_token_count', None)
+    if not prompt_n:
+        return gr.update()
+
+    gen_n = getattr(shared.model, 'last_completion_token_count', 0) or 0
+    total = prompt_n + gen_n
+    max_tokens = state.get('truncation_length') or 0
+    percentage = (total / max_tokens) * 100 if max_tokens > 0 else 0
+    new_value = f"{total:,} / {max_tokens:,} tokens ({percentage:.1f}%)"
+
+    if gen_n > 0:
+        # A drop in gen_n means a new generation (backends reset to 0 per turn).
+        last_seen = getattr(shared.model, '_tps_last_gen_n', None)
+        if last_seen is None or gen_n < last_seen:
+            shared.model._tps_start_time = time.time()
+            shared.model._tps_baseline = gen_n
+        shared.model._tps_last_gen_n = gen_n
+
+        elapsed = time.time() - shared.model._tps_start_time
+        baseline = shared.model._tps_baseline
+        if gen_n > baseline and elapsed > 0:
+            tps = (gen_n - baseline) / elapsed
+            new_value += f"<br>{gen_n:,} generated ({tps:.1f} t/s)"
+        else:
+            new_value += f"<br>{gen_n:,} generated"
+
+    if new_value == getattr(shared.model, '_last_token_display', None):
+        return gr.update()
+    shared.model._last_token_display = new_value
+    return new_value
 
 
 def get_stopping_strings(state):
@@ -1302,6 +1393,13 @@ def character_is_loaded(state, raise_exception=False):
         return True
 
 
+def check_model_loaded_or_raise():
+    model_is_loaded, error_message = utils.check_model_loaded()
+    if not model_is_loaded:
+        import gradio as gr
+        raise gr.Error(error_message)
+
+
 def generate_chat_reply_wrapper(text, state, regenerate=False, _continue=False):
     '''
     Same as above but returns HTML for the UI.
@@ -1311,13 +1409,12 @@ def generate_chat_reply_wrapper(text, state, regenerate=False, _continue=False):
     using metadata['assistant_N']['tool_sequence'].
     '''
 
+    set_viewing_unique_id(state['unique_id'])
+
     if not character_is_loaded(state):
         return
 
-    model_is_loaded, error_message = utils.check_model_loaded()
-    if not model_is_loaded:
-        import gradio as gr
-        raise gr.Error(error_message)
+    check_model_loaded_or_raise()
 
     if state['start_with'] != '' and not _continue:
         if regenerate:
@@ -1395,7 +1492,8 @@ def generate_chat_reply_wrapper(text, state, regenerate=False, _continue=False):
             if visible_prefix:
                 history['visible'][-1][1] = '\n\n'.join(visible_prefix + [_original_visible])
 
-            yield chat_html_wrapper(history, state['name1'], state['name2'], state['mode'], state['chat_style'], state['character_menu'], last_message_only=(i > 0)), history
+            if shared.args.multi_user or viewing_unique_id is None or viewing_unique_id == state['unique_id']:
+                yield chat_html_wrapper(history, state['name1'], state['name2'], state['mode'], state['chat_style'], state['character_menu'], last_message_only=(i > 0)), history
 
             if visible_prefix:
                 history['visible'][-1][1] = _original_visible
@@ -1491,8 +1589,12 @@ def generate_chat_reply_wrapper(text, state, regenerate=False, _continue=False):
             tc_headers.append(f'{fn_name}({args_summary})')
 
         seq_entry = {'tool_calls': serialized}
-        if content_prefix.strip():
-            clean = _strip_channel_tokens(content_prefix)
+        reasoning, body = extract_reasoning(content_prefix)
+        reasoning = (reasoning or '').strip()
+        if reasoning:
+            seq_entry['reasoning_content'] = reasoning
+        if body.strip():
+            clean = _strip_channel_tokens(body)
             if clean:
                 seq_entry['content'] = clean
         seq.append(seq_entry)
@@ -1543,7 +1645,7 @@ def generate_chat_reply_wrapper(text, state, regenerate=False, _continue=False):
 
                 approval = request_tool_approval(_session_key, fn_name)
 
-                if approval == 'reject' and shared.stop_everything:
+                if approval is None:
                     _cancel_remaining(i)
                     yield _render(), history
                     break
@@ -1574,6 +1676,11 @@ def generate_chat_reply_wrapper(text, state, regenerate=False, _continue=False):
         save_history(history, state['unique_id'], state['character_menu'], state['mode'])
 
         state['history'] = history
+
+        # Honor stop here; text_generation resets the flag on re-entry.
+        if shared.stop_everything:
+            break
+
         _tool_turn += 1
 
     state.pop('_tool_turn', None)
@@ -1610,6 +1717,9 @@ def generate_chat_reply_wrapper(text, state, regenerate=False, _continue=False):
                 meta_entry['versions'][current_idx].update(version_update)
 
     save_history(history, state['unique_id'], state['character_menu'], state['mode'])
+
+    if viewing_unique_id == state['unique_id']:
+        set_viewing_unique_id(None)
 
 
 def remove_last_message(history):
@@ -2012,9 +2122,10 @@ def load_character(character, name1, name2):
     greeting_field = 'greeting'
     picture = None
 
+    safe_name = sanitize_filename(character)
     filepath = None
     for extension in ["yml", "yaml", "json"]:
-        filepath = shared.user_data_dir / 'characters' / f'{character}.{extension}'
+        filepath = shared.user_data_dir / 'characters' / f'{safe_name}.{extension}'
         if filepath.exists():
             break
 
@@ -2030,7 +2141,7 @@ def load_character(character, name1, name2):
     for path in [cache_folder / "pfp_character.png", cache_folder / "pfp_character_thumb.png"]:
         path.unlink(missing_ok=True)
 
-    picture = generate_pfp_cache(character)
+    picture = generate_pfp_cache(safe_name)
 
     # Finding the bot's name
     for k in ['name', 'bot', '<|bot|>', 'char_name']:
@@ -2416,6 +2527,8 @@ def handle_remove_last_click(state):
 
 
 def handle_unique_id_select(state):
+    set_viewing_unique_id(state['unique_id'])
+
     history = load_history(state['unique_id'], state['character_menu'], state['mode'])
     html = redraw_html(history, state['name1'], state['name2'], state['mode'], state['chat_style'], state['character_menu'])
 
@@ -2437,6 +2550,7 @@ def handle_start_new_chat_click(state):
 
     if len(histories) > 0:
         past_chats_update = gr.update(choices=histories, value=histories[0][1])
+        set_viewing_unique_id(histories[0][1])
     else:
         past_chats_update = gr.update(choices=histories)
 
@@ -2453,6 +2567,7 @@ def handle_start_incognito_chat_click(state):
 
     histories = find_all_histories_with_first_prompts(state)
     past_chats_update = gr.update(choices=histories, value=unique_id)
+    set_viewing_unique_id(unique_id)
 
     return [history, html, past_chats_update]
 
@@ -2472,6 +2587,8 @@ def handle_delete_chat_confirm_click(state):
     html = redraw_html(history, state['name1'], state['name2'], state['mode'], state['chat_style'], state['character_menu'])
 
     convert_to_markdown.cache_clear()
+
+    set_viewing_unique_id(unique_id)
 
     return [history, html, unique_id]
 
@@ -2499,6 +2616,7 @@ def handle_branch_chat_click(state):
     convert_to_markdown.cache_clear()
 
     past_chats_update = gr.update(choices=histories, value=new_unique_id)
+    set_viewing_unique_id(new_unique_id)
 
     return [history, html, past_chats_update, -1]
 
@@ -2647,6 +2765,7 @@ def handle_upload_chat_history(load_chat_history, state):
 
     if len(histories) > 0:
         past_chats_update = gr.update(choices=histories, value=histories[0][1])
+        set_viewing_unique_id(histories[0][1])
     else:
         past_chats_update = gr.update(choices=histories)
 
@@ -2674,7 +2793,9 @@ def handle_character_menu_change(state):
     convert_to_markdown.cache_clear()
 
     if len(histories) > 0:
-        past_chats_update = gr.update(choices=histories, value=loaded_unique_id or histories[0][1])
+        new_id = loaded_unique_id or histories[0][1]
+        past_chats_update = gr.update(choices=histories, value=new_id)
+        set_viewing_unique_id(new_id)
     else:
         past_chats_update = gr.update(choices=histories)
 
@@ -2722,15 +2843,28 @@ def handle_mode_change(state):
     convert_to_markdown.cache_clear()
 
     if len(histories) > 0:
-        past_chats_update = gr.update(choices=histories, value=loaded_unique_id or histories[0][1])
+        new_id = loaded_unique_id or histories[0][1]
+        past_chats_update = gr.update(choices=histories, value=new_id)
+        set_viewing_unique_id(new_id)
     else:
         past_chats_update = gr.update(choices=histories)
+
+    show_separator, show_reasoning, show_thinking, show_preserve_thinking = utils.get_jinja_control_visibility(state.get('instruction_template_str', ''))
+    not_chat = state['mode'] != 'chat'
 
     return [
         history,
         html,
         gr.update(visible=state['mode'] != 'instruct'),
         gr.update(visible=state['mode'] == 'chat-instruct'),
+        gr.update(visible=not_chat),
+        gr.update(visible=show_reasoning and not_chat),
+        gr.update(visible=show_thinking and not_chat),
+        gr.update(visible=show_preserve_thinking and not_chat),
+        gr.update(visible=show_separator and not_chat),
+        gr.update(visible=not_chat),
+        gr.update(visible=not_chat),
+        gr.update(visible=not_chat),
         past_chats_update
     ]
 
@@ -2767,9 +2901,17 @@ def handle_save_template_click(instruction_template_str):
 
 def handle_delete_template_click(template):
     import gradio as gr
-    root = str(shared.user_data_dir / 'instruction-templates') + '/'
+    from modules.utils import TEMPLATE_EXTENSIONS
+    template_dir = shared.user_data_dir / 'instruction-templates'
+    filename = f"{template}.yaml"
+    for ext in TEMPLATE_EXTENSIONS:
+        if (template_dir / f"{template}{ext}").exists():
+            filename = f"{template}{ext}"
+            break
+
+    root = str(template_dir) + '/'
     return [
-        f"{template}.yaml",
+        filename,
         root,
         root,
         gr.update(visible=True)
