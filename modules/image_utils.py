@@ -25,6 +25,9 @@ def open_image_safely(path):
 
 def convert_pil_to_base64(image: Image.Image) -> str:
     """Converts a PIL Image to a base64 encoded string."""
+    if isinstance(image, str): # audio
+        return image
+    
     buffered = io.BytesIO()
     # Save image to an in-memory bytes buffer in PNG format
     image.save(buffered, format="PNG")
@@ -87,6 +90,13 @@ def process_message_content(content: Any) -> Tuple[str, List[Image.Image]]:
                         logger.warning(f"Failed to fetch external image: {e}")
                 else:
                     logger.warning(f"Unsupported image URL format: {image_url[:70]}...")
+                    
+            elif item_type == 'input_audio':
+                audio_data_item = item.get('input_audio', {})
+                data = audio_data_item.get('data','')
+                format = audio_data_item.get('format','')
+                # images.append(f'data:audio/{format};base64,{data}')
+                images.append(data)
 
         return ' '.join(text_parts), images
 

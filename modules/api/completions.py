@@ -390,6 +390,8 @@ def process_multimodal_content(content):
                 text_parts.append(item.get('text', ''))
             elif item_type == 'image_url':
                 image_placeholders += "<__media__>"
+            elif item_type == 'input_audio':
+                image_placeholders += "<__media__>"
 
         final_text = ' '.join(text_parts)
         if image_placeholders:
@@ -513,12 +515,14 @@ def chat_completions_common(body: dict, is_legacy: bool = False, stream=False, p
             for item in content:
                 if not isinstance(item, dict) or 'type' not in item:
                     raise InvalidRequestError(message="messages: invalid content item format", param='messages')
-                if item['type'] not in ['text', 'image_url']:
+                if item['type'] not in ['text', 'image_url', 'input_audio']:
                     raise InvalidRequestError(message="messages: unsupported content type", param='messages')
                 if item['type'] == 'text' and 'text' not in item:
                     raise InvalidRequestError(message="messages: missing text in content item", param='messages')
                 if item['type'] == 'image_url' and ('image_url' not in item or 'url' not in item['image_url']):
                     raise InvalidRequestError(message="messages: missing image_url in content item", param='messages')
+                if item['type'] == 'input_audio' and ('input_audio' not in item or 'data' not in item['input_audio']):
+                    raise InvalidRequestError(message="messages: missing input_audio in content item", param='messages')
 
     # Chat Completions
     object_type = 'chat.completion' if not stream else 'chat.completion.chunk'
